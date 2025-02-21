@@ -37,12 +37,8 @@ Jan 14, 2001 (Loren Petrich):
 
 
 #include "cseries.h"
-
 #include "sdl_fonts.h"
-
-#ifdef HAVE_OPENGL
 #include "OGL_Headers.h"
-#endif
 
 #include <set>
 
@@ -134,6 +130,7 @@ public:
 	short TxtrWidth, TxtrHeight;
 	int GetTxtrSize() {return int(TxtrWidth)*int(TxtrHeight);}
 	GLuint TxtrID;
+	GLuint NearFilter = GL_LINEAR;
 	uint32 DispList;
 	static std::set<FontSpecifier*> *m_font_registry;
 #endif

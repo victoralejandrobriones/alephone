@@ -34,6 +34,7 @@ Aug 12, 2000 (Loren Petrich):
 */
 
 #include "cstypes.h"
+#include "map.h"
 #include <string>
 
 class FileSpecifier;
@@ -44,8 +45,6 @@ struct wad_data *build_meta_game_wad(const std::string& metadata, const std::str
 bool export_level(FileSpecifier& File);
 
 /* -------------- New functions */
-void pause_game(void);
-void resume_game(void);
 void get_current_saved_game_name(FileSpecifier& File);
 // ZZZ: split this out from new_game; it sets a default filespec in the revert-game info
 void set_saved_game_name_to_default();
@@ -55,8 +54,10 @@ bool process_map_wad(struct wad_data *wad, bool restoring_game, short version);
 
 bool match_checksum_with_map(short vRefNum, long dirID, uint32 checksum, 
 	FileSpecifier& File);
-void set_map_file(FileSpecifier& File);
-
+void set_map_file(FileSpecifier& File, bool runScript = true);
+dynamic_data get_dynamic_data_from_save(FileSpecifier& File);
+bool get_dynamic_data_from_wad(wad_data* wad, dynamic_data* dest);
+bool get_player_data_from_wad(wad_data* wad);
 //CP Addition: get_map_file returns the FileDesc pointer to the current map
 FileSpecifier& get_map_file(void);
 

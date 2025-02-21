@@ -35,7 +35,7 @@
 #include "sdl_network.h"
 #include "network_private.h"
 
-#include <SDL_thread.h>
+#include <SDL2/SDL_thread.h>
 
 #include "thread_priority_sdl.h"
 #include "mytm.h" // mytm_mutex stuff
@@ -51,7 +51,7 @@ static DDPPacketBuffer		ddpPacketBuffer;
 static UDPsocket 		sSocket			= NULL;
 
 // Keep track of the socket-set the receiving thread uses (so we don't have to allocate/free it in that thread)
-static	SDLNet_SocketSet	sSocketSet		= NULL;
+static SDLNet_SocketSet	sSocketSet		= NULL;
 
 // Keep track of the function to call when we receive data
 static PacketHandlerProcPtr	sPacketHandler		= NULL;
@@ -74,48 +74,23 @@ receive_thread_function(void*) {
         if(!sKeepListening)
             break;
         
-        if(theResult > 0) {
-            theResult = SDLNet_UDP_Recv(sSocket, sUDPPacketBuffer);
-            if(theResult > 0) {
-                if(take_mytm_mutex()) {
-                    ddpPacketBuffer.protocolType	= kPROTOCOL_TYPE;
-                    ddpPacketBuffer.sourceAddress	= sUDPPacketBuffer->address;
-                    ddpPacketBuffer.datagramSize	= sUDPPacketBuffer->len;
+        if(theResult > 0 && take_mytm_mutex()) {
+                theResult = SDLNet_UDP_Recv(sSocket, sUDPPacketBuffer);
+                if(theResult > 0) {
+                        ddpPacketBuffer.sourceAddress	= sUDPPacketBuffer->address;
+                        ddpPacketBuffer.datagramSize	= sUDPPacketBuffer->len;
                     
-                    // Hope the other guy is done using whatever's in there!
-                    // (As I recall, all uses happen in sPacketHandler and its progeny, so we should be fine.)
-                    memcpy(ddpPacketBuffer.datagramData, sUDPPacketBuffer->data, sUDPPacketBuffer->len);
+                        // Hope the other guy is done using whatever's in there!
+                        // (As I recall, all uses happen in sPacketHandler and its progeny, so we should be fine.)
+                        memcpy(ddpPacketBuffer.datagramData, sUDPPacketBuffer->data, sUDPPacketBuffer->len);
                     
-                    sPacketHandler(&ddpPacketBuffer);
-                    
-                    release_mytm_mutex();
-                }
-                else
-                    fdprintf("could not take mytm mutex - incoming packet dropped");
-            }
+                        sPacketHandler(&ddpPacketBuffer);
+                    }
+           release_mytm_mutex();
         }
     }
     
     return 0;
-}
-
-
-/*
- *  Initialize/shutdown module
- */
-
-OSErr NetDDPOpen(void)
-{
-//fdprintf("NetDDPOpen\n");
-	// nothing to do
-	return 0;
-}
-
-OSErr NetDDPClose(void)
-{
-//fdprintf("NetDDPClose\n");
-	// nothing to do
-	return 0;
 }
 
 
@@ -126,7 +101,6 @@ OSErr NetDDPClose(void)
 // Incoming port number should be in network byte order.
 OSErr NetDDPOpenSocket(short *ioPortNumber, PacketHandlerProcPtr packetHandler)
 {
-//fdprintf("NetDDPOpenSocket\n");
 	assert(packetHandler);
 
 	// Allocate packet buffer (this is Christian's part)
@@ -174,7 +148,6 @@ OSErr NetDDPOpenSocket(short *ioPortNumber, PacketHandlerProcPtr packetHandler)
 
 OSErr NetDDPCloseSocket(short portNumber)
 {
-//fdprintf("NetDDPCloseSocket\n");
         // ZZZ: shut down receiving thread
         if(sReceivingThread) {
             sKeepListening	= false;
@@ -205,7 +178,6 @@ OSErr NetDDPCloseSocket(short portNumber)
 
 DDPFramePtr NetDDPNewFrame(void)
 {
-//fdprintf("NetDDPNewFrame\n");
 	DDPFramePtr frame = (DDPFramePtr)malloc(sizeof(DDPFrame));
 	if (frame) {
 		memset(frame, 0, sizeof(DDPFrame));
@@ -221,7 +193,6 @@ DDPFramePtr NetDDPNewFrame(void)
 
 void NetDDPDisposeFrame(DDPFramePtr frame)
 {
-//fdprintf("NetDDPDisposeFrame\n");
 	if (frame)
 		free(frame);
 }
@@ -231,9 +202,8 @@ void NetDDPDisposeFrame(DDPFramePtr frame)
  *  Send frame to remote machine
  */
 
-OSErr NetDDPSendFrame(DDPFramePtr frame, NetAddrBlock *address, short protocolType, short port)
+OSErr NetDDPSendFrame(DDPFramePtr frame, const NetAddrBlock *address)
 {
-//fdprintf("NetDDPSendFrame\n");
 	assert(frame->data_size <= ddpMaxData);
 
 	sUDPPacketBuffer->channel = -1;

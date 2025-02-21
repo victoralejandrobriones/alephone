@@ -368,6 +368,24 @@ operator <<(ostream& out, const RoomListMessage& message)
 	return out;
 }
 
+void
+RemoteHubRequestMessage::reallyDeflateTo(AOStream& out) const
+{
+	write_string(out, mVersion);
+}
+
+bool
+RemoteHubListMessage::reallyInflateFrom(AIStream& inStream)
+{
+	while (inStream.maxg() > inStream.tellg())
+	{
+		RemoteHubServerDescription server;
+		m_servers.push_back(server);
+		m_servers.back().read(inStream);
+	}
+
+	return true;
+}
 
 
 void
@@ -597,11 +615,9 @@ operator <<(ostream& out, const PlayerListMessage& message)
 void
 CreateGameMessage::reallyDeflateTo(AOStream& thePacket) const
 {
-	uint16 orderGame = 0;
-	
 	thePacket
 		<< m_gamePort
-		<< orderGame
+		<< m_remoteHubId
 		<< m_description;
 }
 
@@ -909,7 +925,7 @@ GameListMessage::reallyInflateFrom(AIStream& inStream)
 	{
 		GameListEntry entry;
 		inStream >> entry;
-		entry.m_ticks = SDL_GetTicks();
+		entry.m_ticks = machine_tick_count();
 
 		m_entries.push_back(entry);
 	}

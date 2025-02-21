@@ -33,10 +33,7 @@ class NetworkGameProtocol
 public:
 	/* Distribute information to the whole net. */
 	virtual bool	Enter(short* inNetStatePtr) = 0;
-	virtual void	Exit1() = 0;
-	virtual void	Exit2() = 0;
-	virtual void	DistributeInformation(short type, void *buffer, short buffer_size, bool send_to_self, bool only_send_to_team) = 0;
-	virtual bool	Sync(NetTopology* inTopology, int32 inSmallestGameTick, size_t inLocalPlayerIndex, size_t inServerPlayerIndex) = 0;
+	virtual bool	Sync(NetTopology* inTopology, int32 inSmallestGameTick, int inLocalPlayerIndex, bool isServer) = 0;
 	virtual bool	UnSync(bool inGraceful, int32 inSmallestPostgameTick) = 0;
 	virtual int32	GetNetTime() = 0;
 	virtual void	PacketHandler(DDPPacketBuffer* inPacket) = 0;
@@ -46,7 +43,8 @@ public:
 	virtual int32   GetUnconfirmedActionFlagsCount() = 0;
 	virtual uint32  PeekUnconfirmedActionFlag(int32 offset) = 0;
 	virtual void    UpdateUnconfirmedActionFlags() = 0;
-	
+
+	virtual bool CheckWorldUpdate() = 0;
 };
 
 #endif // NETWORKGAMEPROTOCOL_H

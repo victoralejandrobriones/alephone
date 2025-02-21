@@ -10,8 +10,7 @@
       &lt;!-- 
       body {
 	  font-family: Verdana, Helvetica, sans-serif;
-	  font-size: 9pt;
-	  width: 800px;
+	  width: 60rem;
       }
       a:link {
 	  color: #006600;
@@ -55,6 +54,10 @@
 	  margin: 4px;
       }
 
+	  div.tables > p {
+	  margin-left: 0;
+	  }
+
       p.note {
 	  color: #666666;
 	  font-style: italic;
@@ -84,6 +87,7 @@
       }
       
       span.pre {
+	  font-family: monospace;
 	  display: block;
 	  margin: 4px 0;
 	  white-space: pre-wrap;
@@ -103,6 +107,22 @@
 	  color: #006600;
       }
 
+	  details > summary {
+	  list-style: none;
+	  }
+
+	  summary::after {
+	  content: '▶';
+	  font-size: 0.75em;
+	  margin-left: 0.5rem;
+	  }
+	  
+	  details[open] summary:after {
+	  content: '▼';
+	  margin-left: 0.25rem;
+	  font-size: 1em;
+	  }
+
 --&gt;
       </style>
     </head>
@@ -120,36 +140,49 @@
 
 <xsl:template name="toc">
   <li>
-    <a><xsl:attribute name="href">#<xsl:value-of select="@id"/></xsl:attribute>
     <xsl:choose>
-      <xsl:when test="self::triggers">Triggers</xsl:when>
-      <xsl:when test="self::tables">Tables</xsl:when>
-      <xsl:when test="self::types">Types and Mnemonics</xsl:when>
+      <xsl:when test="self::triggers"></xsl:when>
+      <xsl:when test="self::tables"></xsl:when>
+      <xsl:when test="self::types"></xsl:when>
       <xsl:otherwise>
-	<xsl:value-of select="@name"/>
+		<a><xsl:attribute name="href">#<xsl:value-of select="@id"/></xsl:attribute><xsl:value-of select="@name"/></a>
       </xsl:otherwise>
-    </xsl:choose></a>
+    </xsl:choose>
     <xsl:choose>
       <xsl:when test="section and count(ancestor::*) = 1">
 	<ol>
 	  <xsl:for-each select="section"><xsl:call-template name="toc"/></xsl:for-each>
 	</ol>
       </xsl:when>
+	  <xsl:when test="self::triggers">
+		<details><summary><a href="#triggers">Triggers</a></summary>
+		<ol>
+		  <xsl:for-each select="function">
+			<xsl:sort select="@name"/>
+			<li><a><xsl:attribute name="href">#<xsl:value-of select="@name"/></xsl:attribute><xsl:value-of select="@name"/></a></li>
+		  </xsl:for-each>
+		</ol>
+		</details>
+	  </xsl:when>
       <xsl:when test="self::tables">
+		<details><summary><a href="#tables">Tables</a></summary>
 	<ol>
 	  <xsl:for-each select="accessor">
 	    <xsl:sort select="@name"/>
 	    <li><a><xsl:attribute name="href">#<xsl:value-of select="@name"/></xsl:attribute><xsl:value-of select="@name"/></a></li>
 	  </xsl:for-each>
 	</ol>
+		</details>
       </xsl:when>
       <xsl:when test="self::types">
-	<ol>
+		  <details><summary><a href="#types">Types and Mnemonics</a></summary>
+		<ol>
 	  <xsl:for-each select="../tables/enum-accessor">
 	    <xsl:sort select="@nice-name"/>
 	    <li><a><xsl:attribute name="href">#<xsl:value-of select="@name"/></xsl:attribute><xsl:value-of select="@nice-name"/></a></li>
 	  </xsl:for-each>
-	</ol>
+		</ol>
+		  </details>
       </xsl:when>
     </xsl:choose>
   </li>
@@ -163,7 +196,9 @@
     <dt>Triggers</dt>
     <dd>
   <dl>
-    <xsl:apply-templates select="function"/>
+    <xsl:apply-templates select="function">
+	  <xsl:sort select="@name"/>
+	</xsl:apply-templates>
   </dl>
     </dd>
     </dl>
@@ -264,11 +299,17 @@
 </xsl:template>
 
 <xsl:template name="mnemonic">
-  <li>"<xsl:value-of select="@name"/>"</li>
+  <li>"<xsl:value-of select="@name"/>"<xsl:choose><xsl:when test="@version"><xsl:text> </xsl:text><span class="version"><xsl:value-of select="@version"/></span></xsl:when></xsl:choose></li>
 </xsl:template>
 
 <xsl:template match="accessor">
-  <h3><a><xsl:attribute name="name"><xsl:value-of select="@name"/></xsl:attribute></a><xsl:value-of select="@name"/></h3>
+  <h3><a><xsl:attribute name="name"><xsl:value-of select="@name"/></xsl:attribute></a><xsl:value-of select="@name"/><xsl:choose>
+      <xsl:when test="@version">
+	<xsl:text> </xsl:text>
+	<span class="version"><xsl:value-of select="@version"/></span>
+      </xsl:when>
+    </xsl:choose></h3>
+  <xsl:copy-of select="description/node()"/>
   <dl>
     <xsl:apply-templates select="length|call|function|variable"/>
     <xsl:choose>
@@ -325,6 +366,9 @@
 
 <xsl:template match="function">
   <dt>
+	<xsl:if test="parent::triggers">
+	  <a><xsl:attribute name="name"><xsl:value-of select="@name"/></xsl:attribute></a>
+	</xsl:if>
     <xsl:choose>
       <xsl:when test="(parent::table and ../@singleton = 'false') or parent::subtable-accessor or parent::subtable">:</xsl:when>
       <xsl:when test="parent::table or parent::subtable">.</xsl:when>
@@ -342,6 +386,11 @@
 	<xsl:when test="position() != 1">, </xsl:when>
       </xsl:choose>
       <xsl:value-of select="@name"/><xsl:if test="../@named_parameters='true'">=</xsl:if><xsl:choose><xsl:when test="@required = 'false'">]</xsl:when></xsl:choose>
+	  <xsl:choose>
+		<xsl:when test="@version">
+		  <xsl:text> </xsl:text><span class="version"><xsl:value-of select="@version"/></span>
+		</xsl:when>
+	  </xsl:choose>
     </xsl:for-each>
     <xsl:choose>
       <xsl:when test="@named_parameters = 'true'">}</xsl:when>
@@ -366,7 +415,11 @@
 
 <xsl:template match="variable">
   <dt>
-    .<xsl:value-of select="@name"/>
+	<xsl:choose>
+	  <xsl:when test="parent::accessor"><xsl:value-of select="../@name"/>.</xsl:when>
+	  <xsl:otherwise>.</xsl:otherwise>
+	</xsl:choose>
+    <xsl:value-of select="@name"/>
     <xsl:choose>
       <xsl:when test="@access = 'local-player read-only'">
 	<span class="access"> (read-only) (local player)</span>
@@ -421,8 +474,16 @@
 
 <xsl:template match="subtable-accessor">
   <dt>
-    .<xsl:value-of select="@name"/>[<xsl:value-of select="@index"/>]
-  </dt>
+    .<xsl:value-of select="@name"/>[<xsl:value-of select="@index"/>]<xsl:choose>
+	<xsl:when test="@version">
+	  <xsl:text> </xsl:text>
+	  <span class="version"><xsl:value-of select="@version"/></span>
+	</xsl:when>
+  </xsl:choose><xsl:choose>
+      <xsl:when test="@access = 'local-player'">
+      <span class="access"> (local player)</span>
+      </xsl:when>
+    </xsl:choose></dt>
   <dd>
     <xsl:choose>
       <xsl:when test="description">

@@ -46,12 +46,9 @@
 #include "crc.h"
 #include "player.h"
 #include "InfoTree.h"
-
 #include <map>
 
 extern void make_player_really_net_dead(size_t inPlayerIndex);
-extern void call_distribution_response_function_if_available(byte* inBuffer, uint16 inBufferSize, int16 inDistributionType, uint8 inSendingPlayerIndex);
-
 
 enum {
         kDefaultPregameTicksBeforeNetDeath = 90 * TICKS_PER_SECOND,
@@ -59,10 +56,7 @@ enum {
         kDefaultOutgoingFlagsQueueSize = TICKS_PER_SECOND / 2,
         kDefaultRecoverySendPeriod = TICKS_PER_SECOND / 2,
 	kDefaultTimingWindowSize = 3 * TICKS_PER_SECOND,
-	kDefaultTimingNthElement = kDefaultTimingWindowSize / 2,
-	kLossyByteStreamDataBufferSize = 1280,
-	kTypicalLossyByteStreamChunkSize = 56,
-	kLossyByteStreamDescriptorCount = kLossyByteStreamDataBufferSize / kTypicalLossyByteStreamChunkSize
+	kDefaultTimingNthElement = kDefaultTimingWindowSize / 2
 };
 
 struct SpokePreferences
@@ -123,29 +117,13 @@ static WindowedNthElementFinder<int32> sNthElementFinder(kDefaultTimingWindowSiz
 static bool sTimingMeasurementValid;
 static int32 sTimingMeasurement;
 static bool sHeardFromHub = false;
+static bool sWorldUpdate = false;
 
 static vector<int32> sDisplayLatencyBuffer; // stores the last 30 latency calculations, in ticks
 static uint32 sDisplayLatencyCount = 0;
 static int32 sDisplayLatencyTicks = 0; // sum of the latency ticks from the last 30 seconds, using above two
 
 static int32 sSmallestUnconfirmedTick;
-
-struct SpokeLossyByteStreamChunkDescriptor
-{
-	uint16	mLength;
-	int16	mType;
-	uint32	mDestinations;
-};
-
-// This holds outgoing lossy byte stream data
-static CircularByteBuffer sOutgoingLossyByteStreamData(kLossyByteStreamDataBufferSize);
-
-// This holds a descriptor for each chunk of lossy byte stream data held in the above buffer
-static CircularQueue<SpokeLossyByteStreamChunkDescriptor> sOutgoingLossyByteStreamDescriptors(kLossyByteStreamDescriptorCount);
-
-// This is currently used only to hold incoming streaming data until it's passed to the upper-level code
-static byte sScratchBuffer[kLossyByteStreamDataBufferSize];
-
 
 static void spoke_became_disconnected();
 static void spoke_received_game_data_packet_v1(AIStream& ps, bool reflected_flags);
@@ -155,8 +133,6 @@ static void process_messages(AIStream& ps, IncomingGameDataPacketProcessingConte
 static void handle_end_of_messages_message(AIStream& ps, IncomingGameDataPacketProcessingContext& context);
 static void handle_player_net_dead_message(AIStream& ps, IncomingGameDataPacketProcessingContext& context);
 static void handle_timing_adjustment_message(AIStream& ps, IncomingGameDataPacketProcessingContext& context);
-static void handle_lossy_byte_stream_message(AIStream& ps, IncomingGameDataPacketProcessingContext& context);
-static void process_optional_message(AIStream& ps, IncomingGameDataPacketProcessingContext& context, uint16 inMessageType);
 static bool spoke_tick();
 static void send_packet();
 static void send_identification_packet();
@@ -180,11 +156,10 @@ operator !=(const NetAddrBlock& a, const NetAddrBlock& b)
 
 
 static OSErr
-send_frame_to_local_hub(DDPFramePtr frame, NetAddrBlock *address, short protocolType, short port)
+send_frame_to_local_hub(DDPFramePtr frame, NetAddrBlock *address)
 {
         sLocalOutgoingBuffer.datagramSize = frame->data_size;
         memcpy(sLocalOutgoingBuffer.datagramData, frame->data, frame->data_size);
-        sLocalOutgoingBuffer.protocolType = protocolType;
         // An all-0 sourceAddress is the cue for "local spoke" currently.
         obj_clear(sLocalOutgoingBuffer.sourceAddress);
         sNeedToSendLocalOutgoingBuffer = true;
@@ -210,6 +185,7 @@ check_send_packet_to_hub()
 void
 spoke_initialize(const NetAddrBlock& inHubAddress, int32 inFirstTick, size_t inNumberOfPlayers, WritableTickBasedActionQueue* const inPlayerQueues[], bool inPlayerConnected[], size_t inLocalPlayerIndex, bool inHubIsLocal)
 {
+        assert(inLocalPlayerIndex != NONE);
         assert(inNumberOfPlayers >= 1);
         assert(inLocalPlayerIndex < inNumberOfPlayers);
         assert(inPlayerQueues[inLocalPlayerIndex] != NULL);
@@ -252,21 +228,17 @@ spoke_initialize(const NetAddrBlock& inHubAddress, int32 inFirstTick, size_t inN
         sOutstandingTimingAdjustment = 0;
 
         sNetworkTicker = 0;
+		sWorldUpdate = false;
         sLastNetworkTickHeard = 0;
         sLastNetworkTickSent = 0;
         sConnected = true;
 	sNthElementFinder.reset(sSpokePreferences.mTimingWindowSize);
 	sTimingMeasurementValid = false;
 
-	sOutgoingLossyByteStreamDescriptors.reset();
-	sOutgoingLossyByteStreamData.reset();
-
         sMessageTypeToMessageHandler.clear();
         sMessageTypeToMessageHandler[kEndOfMessagesMessageType] = handle_end_of_messages_message;
         sMessageTypeToMessageHandler[kTimingAdjustmentMessageType] = handle_timing_adjustment_message;
         sMessageTypeToMessageHandler[kPlayerNetDeadMessageType] = handle_player_net_dead_message;
-	sMessageTypeToMessageHandler[kHubToSpokeLossyByteStreamMessageType] = handle_lossy_byte_stream_message;
-
         sNeedToSendLocalOutgoingBuffer = false;
 
         sSpokeActive = true;
@@ -303,7 +275,7 @@ spoke_cleanup(bool inGraceful)
         }
 
         // This waits for the tick task to actually finish
-        myTMCleanup(true);
+        myTMCleanup();
         
         sMessageTypeToMessageHandler.clear();
         sNetworkPlayers.clear();
@@ -330,71 +302,6 @@ spoke_get_net_time()
 
 	return (sConnected ? sOutgoingFlags.getWriteTick() - theDelay : getNetworkPlayer(sLocalPlayerIndex).mQueue->getWriteTick());
 }
-
-
-
-void
-spoke_distribute_lossy_streaming_bytes_to_everyone(int16 inDistributionType, byte* inBytes, uint16 inLength, bool inExcludeLocalPlayer, bool onlySendToTeam)
-{
-
-	int16 local_team;
-	if (onlySendToTeam)
-	{
-		player_info* player = (player_info *)NetGetPlayerData(sLocalPlayerIndex);
-		local_team = player->team;
-	}
-
-	uint32 theDestinations = 0;
-	for(size_t i = 0; i < sNetworkPlayers.size(); i++)
-	{
-		if((i != sLocalPlayerIndex || !inExcludeLocalPlayer) && !sNetworkPlayers[i].mZombie && sNetworkPlayers[i].mConnected)
-		{
-			if (onlySendToTeam)
-			{
-				player_info* player = (player_info *)NetGetPlayerData(i);
-				if (player->team == local_team) 
-					theDestinations |= (((uint32)1) << i);
-				
-			}
-			else
-			{
-				theDestinations |= (((uint32)1) << i);
-			}
-		}
-	}
-
-	spoke_distribute_lossy_streaming_bytes(inDistributionType, theDestinations, inBytes, inLength);
-}
-
-
-
-void
-spoke_distribute_lossy_streaming_bytes(int16 inDistributionType, uint32 inDestinationsBitmask, byte* inBytes, uint16 inLength)
-{
-	if(inLength > sOutgoingLossyByteStreamData.getRemainingSpace())
-	{
-		logNoteNMT("spoke has insufficient buffer space for %hu bytes of outgoing lossy streaming type %hd; discarded", inLength, inDistributionType);
-		return;
-	}
-
-	if(sOutgoingLossyByteStreamDescriptors.getRemainingSpace() < 1)
-	{
-		logNoteNMT("spoke has exhausted descriptor buffer space; discarding %hu bytes of outgoing lossy streaming type %hd", inLength, inDistributionType);
-		return;
-	}
-	
-	struct SpokeLossyByteStreamChunkDescriptor theDescriptor;
-	theDescriptor.mLength = inLength;
-	theDescriptor.mDestinations = inDestinationsBitmask;
-	theDescriptor.mType = inDistributionType;
-
-	logDumpNMT("spoke application decided to send %d bytes of lossy streaming type %d destined for players 0x%x", inLength, inDistributionType, inDestinationsBitmask);
-	
-	sOutgoingLossyByteStreamData.enqueueBytes(inBytes, inLength);
-	sOutgoingLossyByteStreamDescriptors.enqueue(theDescriptor);
-}
-
-
 
 static void
 spoke_became_disconnected()
@@ -697,7 +604,7 @@ spoke_received_game_data_packet_v1(AIStream& ps, bool reflected_flags)
 				if(theSmallestUnreadTick >= sSmallestRealGameTick)
 				{
 					WritableTickBasedActionQueue& theQueue = *(sNetworkPlayers[i].mQueue);
-					assert(theQueue.getWriteTick() == sSmallestUnreceivedTick);
+					assert(!sNetworkPlayers[i].mConnected || theQueue.getWriteTick() == sSmallestUnreceivedTick);
 					assert(theQueue.availableCapacity() > 0);
 					logTraceNMT("enqueueing flags %x for player %d tick %d", theFlags, i, theQueue.getWriteTick());
 					theQueue.enqueue(theFlags);
@@ -763,7 +670,7 @@ spoke_received_ping_request(AIStream& ps, NetAddrBlock address)
 		
 		// Send the packet
 		sOutgoingFrame->data_size = ops.tellp();
-		NetDDPSendFrame(sOutgoingFrame, &address, kPROTOCOL_TYPE, 0 /* ignored */);
+		NetDDPSendFrame(sOutgoingFrame, &address);
 	} catch (...) {
 		logWarningNMT("Caught exception while constructing/sending ping response packet");
 	}
@@ -781,28 +688,27 @@ spoke_received_ping_response(AIStream& ps, NetAddrBlock address)
 {
 	uint16 pingIdentifier;
 	ps >> pingIdentifier;
-	
-	// we don't send ping requests, so we don't expect to get one
-	logWarningNMT("Received unexpected ping response packet");
-	
+
+	if (auto pinger = NetGetPinger().lock())
+		pinger->StoreResponse(pingIdentifier);
+	else
+		logWarningNMT("Received unexpected ping response packet");
 } // spoke_received_ping_response()
 
 
 static void
 process_messages(AIStream& ps, IncomingGameDataPacketProcessingContext& context)
 {
-        while(!context.mMessagesDone)
-        {
-                uint16 theMessageType;
-                ps >> theMessageType;
+    while(!context.mMessagesDone)
+    {
+        uint16 theMessageType;
+        ps >> theMessageType;
 
-                MessageTypeToMessageHandler::iterator i = sMessageTypeToMessageHandler.find(theMessageType);
+        MessageTypeToMessageHandler::iterator i = sMessageTypeToMessageHandler.find(theMessageType);
 
-                if(i == sMessageTypeToMessageHandler.end())
-                        process_optional_message(ps, context, theMessageType);
-                else
-                        i->second(ps, context);
-        }
+        if(i != sMessageTypeToMessageHandler.end())
+            i->second(ps, context);
+    }
 }
 
 
@@ -850,53 +756,6 @@ handle_timing_adjustment_message(AIStream& ps, IncomingGameDataPacketProcessingC
 
         context.mGotTimingAdjustmentMessage = true;
 }
-
-
-
-static void
-handle_lossy_byte_stream_message(AIStream& ps, IncomingGameDataPacketProcessingContext& context)
-{
-	uint16 theMessageLength;
-	ps >> theMessageLength;
-
-	size_t theStartOfMessage = ps.tellg();
-
-	int16 theDistributionType;
-	uint8 theSendingPlayer;
-	ps >> theDistributionType >> theSendingPlayer;
-
-	uint16 theDataLength = theMessageLength - (ps.tellg() - theStartOfMessage);
-	uint16 theSpilloverDataLength = 0;
-	if(theDataLength > sizeof(sScratchBuffer))
-	{
-		logNoteNMT("received too many bytes (%d) of lossy streaming data type %d from player %d; truncating", theDataLength, theDistributionType, theSendingPlayer);
-		theSpilloverDataLength = theDataLength - sizeof(sScratchBuffer);
-		theDataLength = sizeof(sScratchBuffer);
-	}
-	ps.read(sScratchBuffer, theDataLength);
-	ps.ignore(theSpilloverDataLength);
-
-	logDumpNMT("received %d bytes of lossy streaming type %d data from player %d", theDataLength, theDistributionType, theSendingPlayer);
-
-	call_distribution_response_function_if_available(sScratchBuffer, theDataLength, theDistributionType, theSendingPlayer);
-}
-
-
-
-static void
-process_optional_message(AIStream& ps, IncomingGameDataPacketProcessingContext& context, uint16 inMessageType)
-{
-        // We don't know of any optional messages, so we just skip any we encounter.
-        // (All optional messages are required to encode their length (not including the
-        // space required for the message type or length) in the two bytes immediately
-        // following the message type.)
-        uint16 theLength;
-        ps >> theLength;
-
-        ps.ignore(theLength);
-}
-
-
 
 static bool
 spoke_tick()
@@ -967,9 +826,6 @@ spoke_tick()
 
 	logDumpNMT("sOutstandingTimingAdjustment is now %d", sOutstandingTimingAdjustment);
 
-	if(sOutgoingLossyByteStreamDescriptors.getCountOfElements() > 0)
-		shouldSend = true;
-
         // If we're connected and (we generated new data or if it's been long enough since we last sent), send.
         if(sConnected)
 	{
@@ -1014,11 +870,22 @@ spoke_tick()
 
         check_send_packet_to_hub();
 
+		sWorldUpdate = true;
+
         // We want to run again.
         return true;
 }
 
+bool spoke_check_world_update()
+{
+	if (sWorldUpdate)
+	{
+		sWorldUpdate = false;
+		return true;
+	}
 
+	return false;
+}
 
 static void
 send_packet()
@@ -1032,36 +899,7 @@ send_packet()
 
                 // Acknowledgement
                 ps << sSmallestUnreceivedTick;
-        
-                // Messages
-		// Outstanding lossy streaming bytes?
-		if(sOutgoingLossyByteStreamDescriptors.getCountOfElements() > 0)
-		{
-			// Note: we make a conscious decision here to dequeue these things before
-			// writing to ps, so that if the latter operation exhausts ps's buffer and
-			// throws, we have less data to mess with next time, and shouldn't end up
-			// throwing every time we try to send here.
-			// If we eventually got smarter about managing packet space, we could try
-			// harder to preserve and pace data - e.g. change the 'if' immediately before this
-			// comment to a 'while', only put in as much data as we think we can fit, etc.
-			SpokeLossyByteStreamChunkDescriptor theDescriptor = sOutgoingLossyByteStreamDescriptors.peek();
-			sOutgoingLossyByteStreamDescriptors.dequeue();
-			
-			uint16 theMessageLength = theDescriptor.mLength + sizeof(theDescriptor.mType) + sizeof(theDescriptor.mDestinations);
 
-			ps << (uint16)kSpokeToHubLossyByteStreamMessageType
-				<< theMessageLength
-				<< theDescriptor.mType
-				<< theDescriptor.mDestinations;
-
-			// XXX unnecessary copy due to overly restrictive interfaces (retaining for clarity)
-			assert(theDescriptor.mLength <= sizeof(sScratchBuffer));
-			sOutgoingLossyByteStreamData.peekBytes(sScratchBuffer, theDescriptor.mLength);
-			sOutgoingLossyByteStreamData.dequeue(theDescriptor.mLength);
-
-			ps.write(sScratchBuffer, theDescriptor.mLength);
-		}
-		
                 // No more messages
                 ps << (uint16)kEndOfMessagesMessageType;
         
@@ -1086,9 +924,9 @@ send_packet()
                 sOutgoingFrame->data_size = ps.tellp();
 
                 if(sHubIsLocal)
-                        send_frame_to_local_hub(sOutgoingFrame, &sHubAddress, kPROTOCOL_TYPE, 0 /* ignored */);
+                        send_frame_to_local_hub(sOutgoingFrame, &sHubAddress);
                 else
-                        NetDDPSendFrame(sOutgoingFrame, &sHubAddress, kPROTOCOL_TYPE, 0 /* ignored */);
+                        NetDDPSendFrame(sOutgoingFrame, &sHubAddress);
 
                 sLastNetworkTickSent = sNetworkTicker;
         }
@@ -1121,9 +959,9 @@ send_identification_packet()
                 // Send the packet
                 sOutgoingFrame->data_size = ps.tellp();
                 if(sHubIsLocal)
-                        send_frame_to_local_hub(sOutgoingFrame, &sHubAddress, kPROTOCOL_TYPE, 0 /* ignored */);
+                        send_frame_to_local_hub(sOutgoingFrame, &sHubAddress);
                 else
-                        NetDDPSendFrame(sOutgoingFrame, &sHubAddress, kPROTOCOL_TYPE, 0 /* ignored */);
+                        NetDDPSendFrame(sOutgoingFrame, &sHubAddress);
         }
         catch (...) {
         }

@@ -55,7 +55,6 @@
 #include "WindowedNthElementFinder.h"
 #include "CircularByteBuffer.h"
 #include "InfoTree.h"
-#include "SDL_timer.h" // SDL_Delay()
 
 #include <vector>
 #include <map>
@@ -63,11 +62,22 @@
 #include <deque>
 #include <numeric>
 #include <cmath>
-#include <fstream>
-#include <iomanip>
-
+#include <atomic>
 #include "crc.h"
 #include "player.h" // for masking out action flags triggers :(
+
+#define DEBUG_TIMING_ADJUSTMENTS
+
+#ifdef DEBUG_TIMING_ADJUSTMENTS
+#include "FileHandler.h"
+#include <ctime>
+#include <sstream>
+#include <iomanip>
+#include <boost/iostreams/stream.hpp>
+static OpenedFile dout_file;
+static boost::iostreams::stream<opened_file_device> dout;
+static bool debug_timing_adjustments = false;
+#endif
 
 // Synchronization:
 // hub_received_network_packet() is not reentrant
@@ -138,11 +148,7 @@ enum {
         kDefaultInGameTicksBeforeNetDeath = 5 * TICKS_PER_SECOND,
 	kDefaultSendPeriod = 1,
         kDefaultRecoverySendPeriod = TICKS_PER_SECOND / 2,
-	kDefaultMinimumSendPeriod = 5,
-	kLossyByteStreamDataBufferSize = 1280,
-	kTypicalLossyByteStreamChunkSize = 56,
-	kLossyByteStreamDescriptorCount = kLossyByteStreamDataBufferSize / kTypicalLossyByteStreamChunkSize,
-
+	kDefaultMinimumSendPeriod = 3,
 	kLatencyBufferSize = TICKS_PER_SECOND * 5, // store 5 seconds of ping counts
 	kDisplayLatencyWindow = TICKS_PER_SECOND * 1, // display last second's ping
 	kJitterUpdateInterval = TICKS_PER_SECOND * 1 / 2
@@ -293,8 +299,8 @@ typedef std::vector<NetworkPlayer_hub>	NetworkPlayerCollection;
 static NetworkPlayerCollection	sNetworkPlayers;
 
 // Local player index is used to decide how to send a packet; ref is used for timing.
-static size_t			sLocalPlayerIndex;
-static size_t			sReferencePlayerIndex;
+static int			sLocalPlayerIndex;
+static int			sReferencePlayerIndex;
 
 static DDPFramePtr	sOutgoingFrame = NULL;
 
@@ -303,30 +309,9 @@ static DDPPacketBuffer	sLocalOutgoingBuffer;
 static bool		sNeedToSendLocalOutgoingBuffer = false;
 #endif
 
-
-struct HubLossyByteStreamChunkDescriptor
-{
-	uint16	mLength;
-	int16	mType;
-	uint32	mDestinations;
-	uint8	mSender;
-};
-
-// This holds outgoing lossy byte stream data
-static CircularByteBuffer sOutgoingLossyByteStreamData(kLossyByteStreamDataBufferSize);
-
-// This holds a descriptor for each chunk of lossy byte stream data held in the above buffer
-static CircularQueue<HubLossyByteStreamChunkDescriptor> sOutgoingLossyByteStreamDescriptors(kLossyByteStreamDescriptorCount);
-
-// This is used to copy between AStream and CircularByteBuffer
-// It's used in both directions, but that's ok because the routines that do so are mutex.
-static byte sScratchBuffer[kLossyByteStreamDataBufferSize];
-
-
 static myTMTaskPtr	sHubTickTask = NULL;
-static bool		sHubActive = false;	// used to enable the packet handler
-static bool		sHubInitialized = false;
-
+static std::atomic_bool	sHubActive = { false };	// used to enable the packet handler
+static bool sHubInitialized = false;
 
 
 static void hub_check_for_completion();
@@ -334,10 +319,10 @@ static void player_acknowledged_up_to_tick(size_t inPlayerIndex, int32 inSmalles
 static bool player_provided_flags_from_tick_to_tick(size_t inPlayerIndex, int32 inFirstNewTick, int32 inSmallestUnreceivedTick);
 static void hub_received_game_data_packet_v1(AIStream& ps, int inSenderIndex);
 static void hub_received_identification_packet(AIStream& ps, NetAddrBlock address);
+static void hub_update_player_pregame_state(int inPlayerIndex, int16 state);
 static void hub_received_ping_request(AIStream& ps, NetAddrBlock address);
 static void hub_received_ping_response(AIStream& ps, NetAddrBlock address);
 static void process_messages(AIStream& ps, int inSenderIndex);
-static void process_optional_message(AIStream& ps, int inSenderIndex, uint16 inMessageType);
 static void make_player_netdead(int inPlayerIndex);
 static bool hub_tick();
 static void send_packets();
@@ -376,12 +361,11 @@ operator <(const NetAddrBlock& a, const NetAddrBlock& b)
 
 
 static OSErr
-send_frame_to_local_spoke(DDPFramePtr frame, NetAddrBlock *address, short protocolType, short port)
+send_frame_to_local_spoke(DDPFramePtr frame, NetAddrBlock *address)
 {
 #ifndef A1_NETWORK_STANDALONE_HUB
         sLocalOutgoingBuffer.datagramSize = frame->data_size;
         memcpy(sLocalOutgoingBuffer.datagramData, frame->data, frame->data_size);
-        sLocalOutgoingBuffer.protocolType = protocolType;
         // We ignore the 'source address' because the spoke does too.
         sNeedToSendLocalOutgoingBuffer = true;
         return noErr;
@@ -412,23 +396,9 @@ check_send_packet_to_spoke()
 #define INT32_MAX 0x7fffffff
 #endif
 
-#define DEBUG_TIMING_ADJUSTMENTS
-
-#ifdef DEBUG_TIMING_ADJUSTMENTS
-#include "FileHandler.h"
-#include <ctime>
-#include <sstream>
-std::ofstream dout;
-bool debug_timing_adjustments = false;
-#endif
-
 void
-hub_initialize(int32 inStartingTick, size_t inNumPlayers, const NetAddrBlock* const* inPlayerAddresses, size_t inLocalPlayerIndex)
+hub_initialize(int32 inStartingTick, int inNumPlayers, const NetAddrBlock* const* inPlayerAddresses, int inLocalPlayerIndex)
 {
-//        assert(sNetworkState == eNetworkDown);
-
-//        sNetworkState = eNetworkJustStartingUp;
-
 #ifdef DEBUG_TIMING_ADJUSTMENTS
 	FileSpecifier fs;
 	fs.SetToLocalDataDir();
@@ -448,10 +418,14 @@ hub_initialize(int32 inStartingTick, size_t inNumPlayers, const NetAddrBlock* co
 		ss << buffer << "_" << inNumPlayers << "P.txt";
 
 		fs.AddPart(ss.str());
-		dout.open(fs.GetPath());
-		dout << "Players: " << inNumPlayers << std::endl;
-		dout << "Latency Tolerance: " << sHubPreferences.mMinimumSendPeriod << std::endl;
-		debug_timing_adjustments = true;
+		
+		if (fs.OpenForWritingText(dout_file))
+		{
+			dout.open(dout_file);
+			dout << "Players: " << inNumPlayers << std::endl;
+			dout << "Latency Tolerance: " << sHubPreferences.mMinimumSendPeriod << std::endl;
+			debug_timing_adjustments = true;
+		}
 	}
 	else
 	{
@@ -459,14 +433,15 @@ hub_initialize(int32 inStartingTick, size_t inNumPlayers, const NetAddrBlock* co
 	}
 #endif
 
-        assert(inLocalPlayerIndex < inNumPlayers);
-        sLocalPlayerIndex = inLocalPlayerIndex;
-	sReferencePlayerIndex = sLocalPlayerIndex;
-
 #ifdef A1_NETWORK_STANDALONE_HUB
-	// There is no local player on standalone hub.
-	sLocalPlayerIndex = (size_t)NONE;
+	assert(inLocalPlayerIndex == NONE);
+	sReferencePlayerIndex = NONE;
+#else
+	assert(inLocalPlayerIndex < inNumPlayers);
+	sReferencePlayerIndex = inLocalPlayerIndex;
 #endif
+
+        sLocalPlayerIndex = inLocalPlayerIndex;
 
 	sSmallestPostGameTick = INT32_MAX;
         sSmallestRealGameTick = inStartingTick;
@@ -489,15 +464,15 @@ hub_initialize(int32 inStartingTick, size_t inNumPlayers, const NetAddrBlock* co
         sAddressToPlayerIndex.clear();
         sConnectedPlayersBitmask = 0;
 
-	sOutgoingLossyByteStreamDescriptors.reset();
-	sOutgoingLossyByteStreamData.reset();
-
         for(size_t i = 0; i < inNumPlayers; i++)
         {
                 NetworkPlayer_hub& thePlayer = sNetworkPlayers[i];
 
                 if(inPlayerAddresses[i] != NULL)
                 {
+#ifdef A1_NETWORK_STANDALONE_HUB
+					if (sReferencePlayerIndex == NONE) sReferencePlayerIndex = i;
+#endif
                         thePlayer.mConnected = true;
                         sConnectedPlayersBitmask |= (((uint32)1) << i);
 			thePlayer.mAddressKnown = false;
@@ -530,11 +505,16 @@ hub_initialize(int32 inStartingTick, size_t inNumPlayers, const NetAddrBlock* co
 		thePlayer.mLatencyTicks = 0;
 		thePlayer.mStats.latency = NetworkStats::invalid;
 		thePlayer.mStats.jitter = NetworkStats::invalid;
+		thePlayer.mStats.pregame_state = thePlayer.mConnected ? NetworkStats::invalid : NetworkStats::disconnected;
 		thePlayer.mStats.errors = 0;
 
                 sFlagsQueues[i].reset(theFirstTick);
 		sLateFlagsQueues[i].reset(theFirstTick);
         }
+
+#ifdef A1_NETWORK_STANDALONE_HUB
+		if (sReferencePlayerIndex == NONE) sReferencePlayerIndex = 0; //we have no connected players at this point, but just in case
+#endif
         
         sPlayerDataDisposition.reset(theFirstTick);
 	sPlayerReflectedFlags.reset(theFirstTick);
@@ -554,7 +534,10 @@ hub_initialize(int32 inStartingTick, size_t inNumPlayers, const NetAddrBlock* co
 	sHubInitialized = true;
 }
 
-
+bool hub_is_active()
+{
+	return sHubActive.load();
+}
 
 void
 hub_cleanup(bool inGraceful, int32 inSmallestPostGameTick)
@@ -578,7 +561,8 @@ hub_cleanup(bool inGraceful, int32 inSmallestPostGameTick)
 			while(sHubActive)
 			{
 // Here we try to isolate the "Classic" Mac OS (we can only sleep on the others)
-				SDL_Delay(10);
+				// TODO: replace with a cond?
+				yield();
 			}
 		}
 		else
@@ -599,7 +583,7 @@ hub_cleanup(bool inGraceful, int32 inSmallestPostGameTick)
 	
 		// This waits for the tick task to actually finish - so we know the tick task isn't in
 		// the middle of processing when we do the rest of the cleanup below.
-		myTMCleanup(true);
+		myTMCleanup();
 		
 		sNetworkPlayers.clear();
 		sFlagsQueues.clear();
@@ -613,6 +597,7 @@ hub_cleanup(bool inGraceful, int32 inSmallestPostGameTick)
 		if (debug_timing_adjustments)
 		{
 			dout.close();
+			dout_file.Close();
 		}
 #endif
 	}
@@ -637,7 +622,7 @@ hub_check_for_completion()
 		}
 	}
 
-	if(!someoneStillActive)
+	if (!someoneStillActive) 
 		sHubActive = false;
 }
 		
@@ -694,6 +679,7 @@ hub_received_network_packet(DDPPacketBufferPtr inPacket)
 				
 				if (getNetworkPlayer(theSenderIndex).mConnected)
 				{
+					hub_update_player_pregame_state(theSenderIndex, NetworkStats::valid);
 					hub_received_game_data_packet_v1(ps, theSenderIndex);
 				}
 				else
@@ -728,6 +714,14 @@ hub_received_network_packet(DDPPacketBufferPtr inPacket)
         check_send_packet_to_spoke();
 }
 
+static void 
+hub_update_player_pregame_state(int inPlayerIndex, int16 state)
+{
+	if (sNetworkPlayers[inPlayerIndex].mStats.pregame_state == NetworkStats::invalid && sSmallestUnsentTick < sSmallestRealGameTick)
+	{
+		sNetworkPlayers[inPlayerIndex].mStats.pregame_state = state;
+	}
+}
 
 static void
 hub_received_identification_packet(AIStream& ps, NetAddrBlock address)
@@ -774,7 +768,7 @@ hub_received_ping_request(AIStream& ps, NetAddrBlock address)
 		
 		// Send the packet
 		sOutgoingFrame->data_size = ops.tellp();
-		NetDDPSendFrame(sOutgoingFrame, &address, kPROTOCOL_TYPE, 0 /* ignored */);
+		NetDDPSendFrame(sOutgoingFrame, &address);
 	} catch (...) {
 		logWarningNMT("Caught exception while constructing/sending ping response packet");
 	}
@@ -963,10 +957,8 @@ hub_received_game_data_packet_v1(AIStream& ps, int inSenderIndex)
 				}
 				dout << std::endl;
 			}
-
-		}
-		
 #endif
+		}
 	}
 	
         // Do any needed post-processing
@@ -1064,8 +1056,10 @@ static bool make_up_flags_for_first_incomplete_tick()
 		return false;
 
 	// never make up flags for ourself
+#ifndef A1_NETWORK_STANDALONE_HUB
 	if (getFlagsQueue(sLocalPlayerIndex).getWriteTick() == sSmallestIncompleteTick)
 		return false;
+#endif
 
 	// check to make sure everyone we want to make up flags for is in the lagging players bitmask
 	for (int i = 0; i < sNetworkPlayers.size(); i++)
@@ -1181,85 +1175,10 @@ process_messages(AIStream& ps, int inSenderIndex)
                                 break;
 
                         default:
-                                process_optional_message(ps, inSenderIndex, theMessageType);
                                 break;
                 }
         }
 }
-
-
-
-static void
-process_lossy_byte_stream_message(AIStream& ps, int inSenderIndex, uint16 inLength)
-{
-	assert(inSenderIndex >= 0 && inSenderIndex < static_cast<int>(sNetworkPlayers.size()));
-
-	HubLossyByteStreamChunkDescriptor theDescriptor;
-
-	size_t theHeaderStreamPosition = ps.tellg();
-	ps >> theDescriptor.mType >> theDescriptor.mDestinations;
-	theDescriptor.mLength = inLength - (ps.tellg() - theHeaderStreamPosition);
-	theDescriptor.mSender = inSenderIndex;
-
-	logDumpNMT("got %d bytes of lossy stream type %d from player %d for destinations 0x%x", theDescriptor.mLength, theDescriptor.mType, theDescriptor.mSender, theDescriptor.mDestinations);
-
-	bool canEnqueue = true;
-	
-	if(sOutgoingLossyByteStreamDescriptors.getRemainingSpace() < 1)
-	{
-		logNoteNMT("no descriptor space remains; discarding (%uh) bytes of lossy streaming data of distribution type %hd from player %hu destined for 0x%lx", theDescriptor.mLength, theDescriptor.mType, theDescriptor.mSender, theDescriptor.mDestinations);
-		canEnqueue = false;
-	}
-
-	// We avoid enqueueing a partial chunk to make things easier on code that uses us
-	if(theDescriptor.mLength > sOutgoingLossyByteStreamData.getRemainingSpace())
-	{
-		logNoteNMT("insufficient buffer space for %uh bytes of lossy streaming data of distribution type %hd from player %hu destined for 0x%lx; discarded", theDescriptor.mLength, theDescriptor.mType, theDescriptor.mSender, theDescriptor.mDestinations);
-		canEnqueue = false;
-	}
-
-	if(canEnqueue)
-	{
-		if(theDescriptor.mLength > 0)
-		{
-			// This is an assert, not a test, because the data buffer should be no
-			// bigger than the scratch buffer (and if it didn't fit into the data buffer,
-			// canEnqueue would be false).
-			assert(theDescriptor.mLength <= sizeof(sScratchBuffer));
-
-			// XXX extraneous copy, needed given the current interfaces to these things
-			ps.read(sScratchBuffer, theDescriptor.mLength);
-	
-			sOutgoingLossyByteStreamData.enqueueBytes(sScratchBuffer, theDescriptor.mLength);
-			sOutgoingLossyByteStreamDescriptors.enqueue(theDescriptor);
-		}
-	}
-	else
-		// We still have to gobble up the entire message, even if we can't use it.
-		ps.ignore(theDescriptor.mLength);
-}
-
-
-
-static void
-process_optional_message(AIStream& ps, int inSenderIndex, uint16 inMessageType)
-{
-        // All optional messages are required to give their length in the two bytes
-        // immediately following their type.  (The message length value does not include
-        // the space required for the message type ID or the encoded message length.)
-        uint16 theMessageLength;
-        ps >> theMessageLength;
-
-	if(inMessageType == kSpokeToHubLossyByteStreamMessageType)
-		process_lossy_byte_stream_message(ps, inSenderIndex, theMessageLength);
-	else
-	{
-		// Currently we ignore (skip) all optional messages
-		ps.ignore(theMessageLength);
-	}
-}
-
-
 
 static void
 make_player_netdead(int inPlayerIndex)
@@ -1268,6 +1187,10 @@ make_player_netdead(int inPlayerIndex)
 	
         NetworkPlayer_hub& thePlayer = getNetworkPlayer(inPlayerIndex);
 
+#ifdef A1_NETWORK_STANDALONE_HUB
+		int nbRemainingPlayers = 0, remainingPlayerIndex = 0;
+#endif
+
 	// make sure we're not processing a packet
 	{
 		MyTMMutexTaker mutex;
@@ -1275,7 +1198,27 @@ make_player_netdead(int inPlayerIndex)
 		thePlayer.mConnected = false;
 		sConnectedPlayersBitmask &= ~(((uint32)1) << inPlayerIndex);
 		sAddressToPlayerIndex.erase(thePlayer.mAddress);
+		hub_update_player_pregame_state(inPlayerIndex, NetworkStats::disconnected);
+
+#ifdef A1_NETWORK_STANDALONE_HUB
+		for (size_t i = 0; i < sNetworkPlayers.size(); i++)
+		{
+			if (sNetworkPlayers[i].mConnected)
+			{
+				nbRemainingPlayers++;
+				remainingPlayerIndex = i;
+			}
+		}
+
+		if (sReferencePlayerIndex == inPlayerIndex) //fallback to someone else to be the player of reference
+			sReferencePlayerIndex = remainingPlayerIndex;
+#endif
 	}
+
+#ifdef A1_NETWORK_STANDALONE_HUB
+	if (nbRemainingPlayers == 1)
+		make_player_netdead(remainingPlayerIndex);
+#endif
 
 	// We save this off because player_provided... call below may change it.
 	int32 theSavedIncompleteTick = sSmallestIncompleteTick;
@@ -1439,21 +1382,6 @@ hub_tick()
 static void
 send_packets()
 {
-	// Currently, at most one lossy data descriptor is used per trip through this function.  So,
-	// we do some processing here outside the loop since the results'd be the same every time.
-	HubLossyByteStreamChunkDescriptor theDescriptor = { 0, 0, 0, 0 };
-	bool haveLossyData = false;
-	if(sOutgoingLossyByteStreamDescriptors.getCountOfElements() > 0)
-	{
-		haveLossyData = true;
-		theDescriptor = sOutgoingLossyByteStreamDescriptors.peek();
-
-		// XXX extraneous copy due to limited interfaces
-		// We assert here; the real "test" happened when it was enqueued.
-		assert(theDescriptor.mLength <= sizeof(sScratchBuffer));
-		sOutgoingLossyByteStreamData.peekBytes(sScratchBuffer, theDescriptor.mLength);
-	}
-
 	// remember when we sent flags for the first time
 	for (int32 i = sFlagSendTimeQueue.getWriteTick(); i < sSmallestIncompleteTick; i++) 
 	{
@@ -1491,21 +1419,6 @@ send_packets()
                                                         << sNetworkPlayers[j].mNetDeadTick;
                                         }
                                 }
-
-				// Lossy streaming data?
-				if(haveLossyData && ((theDescriptor.mDestinations & (((uint32)1) << i)) != 0))
-				{
-					logDumpNMT("packet to player %d will contain %d bytes of lossy byte stream type %d from player %d", i, theDescriptor.mLength, theDescriptor.mType, theDescriptor.mSender);
-					// In AStreams, sizeof(packed scalar) == sizeof(unpacked scalar)
-					uint16 theMessageLength = sizeof(theDescriptor.mType) + sizeof(theDescriptor.mSender) + theDescriptor.mLength;
-					
-					ps << (uint16)kHubToSpokeLossyByteStreamMessageType
-						<< theMessageLength
-						<< theDescriptor.mType
-						<< theDescriptor.mSender;
-
-					ps.write(sScratchBuffer, theDescriptor.mLength);
-				}
         
                                 // End of messages
                                 ps << (uint16)kEndOfMessagesMessageType;
@@ -1623,9 +1536,9 @@ send_packets()
                                 // Send the packet
                                 sOutgoingFrame->data_size = ps.tellp();
                                 if(i == sLocalPlayerIndex)
-                                        send_frame_to_local_spoke(sOutgoingFrame, &thePlayer.mAddress, kPROTOCOL_TYPE, 0 /* ignored */);
+                                        send_frame_to_local_spoke(sOutgoingFrame, &thePlayer.mAddress);
                                 else
-                                        NetDDPSendFrame(sOutgoingFrame, &thePlayer.mAddress, kPROTOCOL_TYPE, 0 /* ignored */);
+                                        NetDDPSendFrame(sOutgoingFrame, &thePlayer.mAddress);
                         } // try
                         catch (...)
                         {
@@ -1638,12 +1551,6 @@ send_packets()
 
         sLastNetworkTickSent = sNetworkTicker;
 	sSmallestUnsentTick = sSmallestIncompleteTick;
-
-	if(haveLossyData)
-	{
-		sOutgoingLossyByteStreamData.dequeue(theDescriptor.mLength);
-		sOutgoingLossyByteStreamDescriptors.dequeue();
-	}
 	
 } // send_packets()
 
